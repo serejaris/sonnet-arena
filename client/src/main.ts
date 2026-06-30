@@ -1,7 +1,7 @@
 import * as THREE from "three";
-import { Client } from "@colyseus/sdk";
 import { createLevel } from "./level";
 import { PlayerController } from "./playerController";
+import { NetworkClient } from "./network";
 
 function setupScene() {
   const scene = new THREE.Scene();
@@ -59,31 +59,30 @@ function startRenderLoop({
   camera,
   renderer,
   controller,
-}: ReturnType<typeof setupScene> & { controller: PlayerController }) {
+  network,
+}: ReturnType<typeof setupScene> & { controller: PlayerController; network: NetworkClient }) {
   const clock = new THREE.Clock();
 
   function tick() {
     const delta = Math.min(clock.getDelta(), 0.1); // clamp to avoid spikes after tab-switch
-    controller.update(delta);
+
+    // Local prediction (unchanged from M1) — returns this tick's input
+    // intent so it can be sent to the server and buffered for
+    // reconciliation. null while the pointer isn't locked (nothing to send).
+    const frameInput = controller.update(delta);
+    if (frameInput) {
+      network.sendInput(frameInput, delta);
+    }
+
+    network.updateRemoteInterpolation();
     renderer.render(scene, camera);
     requestAnimationFrame(tick);
   }
   requestAnimationFrame(tick);
 }
 
-function connectToServer() {
-  const endpoint = import.meta.env.DEV
-    ? "ws://localhost:2567"
-    : location.origin.replace(/^http/, "ws");
-
-  const client = new Client(endpoint);
-  client
-    .joinOrCreate("arena")
-    .then((room) => console.log("joined", room.sessionId))
-    .catch((err) => console.error("colyseus join failed", err));
-}
-
 const sceneSetup = setupScene();
 const controller = setupPlayer(sceneSetup);
-startRenderLoop({ ...sceneSetup, controller });
-connectToServer();
+const network = new NetworkClient(sceneSetup.scene, controller);
+network.connect().catch((err) => console.error("colyseus connect failed", err));
+startRenderLoop({ ...sceneSetup, controller, network });

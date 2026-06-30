@@ -12,12 +12,15 @@
     "colyseus": "^0.17.10",
     "@colyseus/schema": "^4.0.27",
     "@colyseus/ws-transport": "^0.17.13",
-    "express": "^5.2.1"
+    "express": "^5.2.1",
+    "three": "^0.185.0",
+    "three-mesh-bvh": "^0.9.10"
   },
   "devDependencies": {
     "typescript": "^6.0.3",
     "tsx": "^4.22.4",
     "@types/express": "^5.0.6",
-    "@types/node": "^26.0.1"
+    "@types/node": "^26.0.1",
+    "@types/three": "^0.185.0"
   }
 }

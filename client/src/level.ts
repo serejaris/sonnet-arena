@@ -4,6 +4,12 @@ import * as THREE from "three";
  * M1 blockout: a simple enclosed boxy arena (ground + 4 outer walls +
  * a handful of interior obstacles). No textures, flat colors only —
  * real art is M4's job (asset-swap milestone, see PLAN.md).
+ *
+ * server/src/level.ts duplicates this geometry's literal coordinates for
+ * server-authoritative collision (M2). This is intentional duplication for
+ * a one-off demo, not a shared package — if the layout here ever changes,
+ * update server/src/level.ts to match or client/server collision will
+ * desync from what's rendered.
  */
 
 export interface Level {

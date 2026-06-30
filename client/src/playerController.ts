@@ -16,8 +16,11 @@ const GRAVITY = -30;
 const JUMP_SPEED = 9;
 const MOVE_SPEED = 6;
 
-const CAPSULE_RADIUS = 0.4;
-const CAPSULE_HEIGHT = 1.8;
+// Exported so M2 networking code (remote-player placeholder meshes) can size
+// avatars consistently with the actual collision capsule, without duplicating
+// the numbers.
+export const CAPSULE_RADIUS = 0.4;
+export const CAPSULE_HEIGHT = 1.8;
 const EYE_HEIGHT = CAPSULE_HEIGHT - 0.1;
 
 // Below this, the player is assumed to have fallen out of the level.
@@ -29,6 +32,24 @@ interface InputState {
   left: boolean;
   right: boolean;
   jump: boolean;
+}
+
+/**
+ * Snapshot of the input that drove one local physics tick — this is what
+ * gets sent to the server (plus `seq`/`dt`) and re-applied verbatim during
+ * reconciliation replay. `dz`/`dx` are camera-relative axis intents (the
+ * same `moveForward`/`moveRight` accumulators applyInput already computes
+ * before rotating them into world space), NOT a world-space vector — this
+ * matches server/src/physics.ts's `PlayerInput` exactly (see CLAUDE.md
+ * "Известные отклонения" / the server M2 report this client was built
+ * against), so replaying an input client-side and processing it
+ * server-side both rotate it by the same `rotY` and land on the same result.
+ */
+export interface NetworkInput {
+  dz: number;
+  dx: number;
+  jump: boolean;
+  rotY: number;
 }
 
 function buildLevelBVH(meshes: THREE.Mesh[]): MeshBVH {
@@ -73,6 +94,24 @@ export class PlayerController {
   private readonly capsulePoint = new THREE.Vector3();
   private readonly correction = new THREE.Vector3();
 
+  // This frame's input intent, recorded by applyInput() and handed back to
+  // the caller of update() so it can be sent over the network unchanged.
+  private lastDz = 0;
+  private lastDx = 0;
+  private lastYaw = 0;
+
+  // Scratch state for predictReplayStep()'s reconciliation replay, kept
+  // separate from the live forwardVec/rightVec/moveDir above so replaying a
+  // historical input never depends on (or clobbers) the live camera-driven
+  // path. Mirrors server/src/physics.ts's dummyYaw trick exactly: a real
+  // THREE.Camera is required because Camera.getWorldDirection() negates the
+  // base Object3D result to match the "-Z is forward" convention — a plain
+  // Object3D would silently invert movement (see CLAUDE.md deviations).
+  private readonly replayYawCamera = new THREE.PerspectiveCamera();
+  private readonly replayForwardVec = new THREE.Vector3();
+  private readonly replayRightVec = new THREE.Vector3();
+  private readonly replayMoveDir = new THREE.Vector3();
+
   constructor(
     camera: THREE.PerspectiveCamera,
     domElement: HTMLElement,
@@ -91,19 +130,40 @@ export class PlayerController {
     window.addEventListener("keyup", (event) => this.setKey(event.code, false));
   }
 
-  update(delta: number): void {
-    if (!this.controls.isLocked) return;
+  /**
+   * Advances local prediction by one frame, exactly as M1 did. Returns the
+   * input intent that drove this tick (for the M2 networking layer to send
+   * to the server and buffer for reconciliation), or `null` while the
+   * pointer isn't locked (no input is being produced, mirrors the original
+   * early-return — nothing to send).
+   */
+  update(delta: number): NetworkInput | null {
+    if (!this.controls.isLocked) return null;
 
     this.applyInput(delta);
-    this.velocity.y += GRAVITY * delta;
-    this.position.addScaledVector(this.velocity, delta);
-    this.resolveCollisions(delta);
+    this.integratePhysics(delta);
+    this.updateCameraPosition();
 
-    if (this.position.y < RESPAWN_Y_THRESHOLD) {
-      this.position.copy(this.spawnPosition);
-      this.velocity.set(0, 0, 0);
+    return { dz: this.lastDz, dx: this.lastDx, jump: this.input.jump, rotY: this.lastYaw };
+  }
+
+  /**
+   * Reconciliation: snap to the server's authoritative position for this
+   * player, then replay every input the server hasn't acknowledged yet
+   * (`pendingInputs`, already filtered to `seq > lastProcessedInputSeq` by
+   * the caller) through the exact same physics pipeline `update()` uses.
+   * Velocity is intentionally left as-is (not reset from the server, which
+   * doesn't sync it) — only position is authoritative, per the schema
+   * contract in PLAN.md.
+   */
+  applyServerCorrection(
+    authoritative: { x: number; y: number; z: number },
+    pendingInputs: ReadonlyArray<{ dz: number; dx: number; jump: boolean; dt: number; rotY: number }>,
+  ): void {
+    this.position.set(authoritative.x, authoritative.y, authoritative.z);
+    for (const input of pendingInputs) {
+      this.predictReplayStep(input);
     }
-
     this.updateCameraPosition();
   }
 
@@ -145,6 +205,14 @@ export class PlayerController {
     if (this.input.right) moveRight += 1;
     if (this.input.left) moveRight -= 1;
 
+    // Recorded for the networking layer: dz/dx are the raw camera-relative
+    // intent (pre-rotation), rotY is the yaw that the server will rotate it
+    // by — together they let the server (and our own replay) reconstruct
+    // forwardVec/rightVec independently and land on the same moveDir.
+    this.lastDz = moveForward;
+    this.lastDx = moveRight;
+    this.lastYaw = Math.atan2(-this.forwardVec.x, -this.forwardVec.z);
+
     this.moveDir.set(0, 0, 0);
     if (moveForward !== 0 || moveRight !== 0) {
       this.moveDir
@@ -153,13 +221,56 @@ export class PlayerController {
         .normalize(); // normalize so diagonal movement isn't faster
     }
 
-    this.velocity.x = this.moveDir.x * MOVE_SPEED;
-    this.velocity.z = this.moveDir.z * MOVE_SPEED;
+    this.applyMovementVelocity(this.moveDir, this.input.jump);
+  }
 
-    if (this.input.jump && this.onGround) {
+  /** Shared by the live path (applyInput) and replay (predictReplayStep). */
+  private applyMovementVelocity(moveDir: THREE.Vector3, jump: boolean): void {
+    this.velocity.x = moveDir.x * MOVE_SPEED;
+    this.velocity.z = moveDir.z * MOVE_SPEED;
+
+    if (jump && this.onGround) {
       this.velocity.y = JUMP_SPEED;
       this.onGround = false;
     }
+  }
+
+  /** Gravity + integrate + collide + respawn-check — shared tail of update() and predictReplayStep(). */
+  private integratePhysics(dt: number): void {
+    this.velocity.y += GRAVITY * dt;
+    this.position.addScaledVector(this.velocity, dt);
+    this.resolveCollisions(dt);
+
+    if (this.position.y < RESPAWN_Y_THRESHOLD) {
+      this.position.copy(this.spawnPosition);
+      this.velocity.set(0, 0, 0);
+    }
+  }
+
+  /**
+   * Deterministically replays one historical input (used only by
+   * applyServerCorrection's reconciliation loop). Unlike applyInput(), the
+   * forward/right basis comes from the input's own recorded `rotY` — via the
+   * same dummy-camera trick server/src/physics.ts uses — rather than from
+   * the live camera, since the camera may have since turned further.
+   */
+  private predictReplayStep(input: { dz: number; dx: number; jump: boolean; dt: number; rotY: number }): void {
+    this.replayYawCamera.rotation.set(0, input.rotY, 0);
+    this.replayYawCamera.getWorldDirection(this.replayForwardVec);
+    this.replayForwardVec.y = 0;
+    this.replayForwardVec.normalize();
+    this.replayRightVec.crossVectors(this.replayForwardVec, this.camera.up).normalize();
+
+    this.replayMoveDir.set(0, 0, 0);
+    if (input.dz !== 0 || input.dx !== 0) {
+      this.replayMoveDir
+        .addScaledVector(this.replayForwardVec, input.dz)
+        .addScaledVector(this.replayRightVec, input.dx)
+        .normalize();
+    }
+
+    this.applyMovementVelocity(this.replayMoveDir, input.jump);
+    this.integratePhysics(input.dt);
   }
 
   private resolveCollisions(delta: number): void {
