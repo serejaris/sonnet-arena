@@ -95,21 +95,22 @@ One Node process serves both the static client bundle and the WS upgrade, same o
 
 ### 4. Deployment contract (corp-server)
 
-**Container primitive: LXC, not Docker.** corp-server's documented convention reserves Docker for a future VM ("LXC плохо подходит для Docker-heavy задач" — `docs/live-agent-sandbox-prd.md`); every existing app workload, including the closest precedent (CT242's public Node game-server preview), runs as a native Node process in an LXC managed by systemd. Following that convention instead of introducing Docker is the deliberate "container of choice" here — it matches existing ops tooling and has a working precedent on this exact infra.
+**Container primitive: LXC, not Docker.** corp-server's documented convention reserves Docker for a future VM ("LXC плохо подходит для Docker-heavy задач" — `docs/live-agent-sandbox-prd.md`); every existing app workload, including an existing precedent (a public Node game-server preview already running on this infra), runs as a native Node process in an LXC managed by systemd. Following that convention instead of introducing Docker is the deliberate "container of choice" here — it matches existing ops tooling and has a working precedent on this exact infra.
+
+Exact hostname, internal IP range, and the public-port NAT convention are operational details for this corp-server and are tracked privately (its own ops docs/issue), not in this public repo — only the externally-relevant facts are below.
 
 | item | value |
 |---|---|
 | Primitive | new LXC container, cloned from existing template |
-| Hostname | `sonnet-arena-01` |
-| Network | private IP on `vmbr1`, `10.50.0.x` |
+| Network | private IP on the corp-server's internal LAN (documented privately) |
 | Resources | 2 vCPU / 4GB RAM / 20GB disk (well inside the documented 2-4 vCPU / 6-8GB guidance; a 20Hz arena shooter for ≤40 players is light) |
-| App process | single Node process (Colyseus server + static client, same port), `0.0.0.0:3100` — reuses the `3100` convention already used by CT242 |
+| App process | single Node process (Colyseus server + static client, same port), bound internally on the container |
 | In-CT service | systemd unit `sonnet-arena-app.service`, `Restart=always` |
-| Public exposure | host-side iptables DNAT, `Type=oneshot` systemd unit `sonnet-arena-nat.service`, public port `<CTID>80` per the established convention (e.g. CT244 → `24480`) forwarding to `<ct-ip>:3100` |
+| Public exposure | host-side iptables DNAT, `Type=oneshot` systemd unit `sonnet-arena-nat.service`, public port assigned per the corp-server's established NAT convention (documented privately), forwarding to the container's internal IP |
 | TLS | **none** — corp-server has no reverse proxy/TLS layer yet; the page is served plain `http://`, which is consistent (no mixed-content issue) since nothing on it is loaded over https. Documented limitation, not a blocker for a stream demo. |
 | Pre-deploy gate | corp-server's live-change policy requires an issue recording target CTID/IP/port/expected-effect/rollback **before** the NAT rule goes live — this is a hard gate on this infra, filed as part of Milestone 6 below, not skipped because it's "just a demo" |
 | Rollback | `systemctl stop sonnet-arena-nat.service` (removes public exposure) + `pct stop <ctid>` |
-| Shared link | `http://51.178.66.9:<port>/` |
+| Shared link | `http://<corp-server-ip>:<port>/` — actual host/port shared on stream at go-live, not published here ahead of time |
 
 ### 5. Testing contract
 
@@ -119,7 +120,7 @@ One Node process serves both the static client bundle and the WS upgrade, same o
 | Local multiplayer | two browser tabs vs `localhost` server | state sync, interpolation, hit registration all visibly correct |
 | Bot load test | small Node script using the Colyseus client SDK spins up N (~30-40) headless fake clients with randomized input | server CPU/bandwidth stay healthy at expected stream concurrency, run **before** trusting the live deploy |
 | Network degradation | throttle one tab via devtools (e.g. simulated latency/"Slow 3G") | prediction/reconciliation still feels acceptable, not just on perfect localhost |
-| Remote smoke test | hit the actual deployed `http://51.178.66.9:<port>/` from outside the corp-server LAN (phone hotspot + laptop, two different networks) | WS upgrade survives the iptables DNAT path end-to-end — this exact class of bug is the one most likely to surprise us, since it's never been exercised for this app before |
+| Remote smoke test | hit the actual deployed `http://<corp-server-ip>:<port>/` from outside the corp-server LAN (phone hotspot + laptop, two different networks) | WS upgrade survives the iptables DNAT path end-to-end — this exact class of bug is the one most likely to surprise us, since it's never been exercised for this app before |
 | Go/no-go (right before going live) | `/healthz` returns 200; two real external devices can join, see each other move, shoot, die, respawn; no console errors | all must pass before sharing the link on stream |
 
 ## Milestones
@@ -138,11 +139,11 @@ One Node process serves both the static client bundle and the WS upgrade, same o
 ## Risks & cut-lines
 
 - **No TLS on corp-server** — plain `http://` link. Acceptable for a live demo; flagged, not silently hidden.
-- **Untested WS-through-iptables-DNAT path for this app** — mitigated by the explicit remote smoke test in M6/M7, not assumed to "just work" because CT242 ran an HTTP (not WS-heavy) app.
+- **Untested WS-through-iptables-DNAT path for this app** — mitigated by the explicit remote smoke test in M6/M7, not assumed to "just work" because the existing precedent ran an HTTP (not WS-heavy) app.
 - **LXC resource ceiling unverified for real concurrency** — mitigated by the bot load test in M6, run before relying on the box live.
 - **Live-change policy is a hard gate**, not a courtesy — corp-server requires the issue-with-rollback before opening the public port even for a one-off demo; budget time for it in M6.
 - **If behind schedule, cut in this order:** M5 entirely → ship one weapon, not several → no enemy AI/bots, PvP-only → no respawn invulnerability frames → reuse the blockout level instead of a fully dressed arena. Never cut: movement feel, shooting that reliably registers, and the "one link, shared room" moment — that's the actual payload for the stream.
 
 ## Deliverable
 
-`http://51.178.66.9:<port>/` shared live in stream chat. Viewers open it, land in the same `arena` room automatically, move and shoot each other in real time with low-poly CC0 art, in any modern browser, no install.
+`http://<corp-server-ip>:<port>/` shared live in stream chat. Viewers open it, land in the same `arena` room automatically, move and shoot each other in real time with low-poly CC0 art, in any modern browser, no install.
