@@ -1,5 +1,7 @@
 import * as THREE from "three";
 import { Client } from "@colyseus/sdk";
+import { createLevel } from "./level";
+import { PlayerController } from "./playerController";
 
 function setupScene() {
   const scene = new THREE.Scene();
@@ -11,8 +13,6 @@ function setupScene() {
     0.1,
     1000,
   );
-  camera.position.set(0, 3, 6);
-  camera.lookAt(0, 0.5, 0);
 
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setSize(window.innerWidth, window.innerHeight);
@@ -24,38 +24,47 @@ function setupScene() {
     renderer.setSize(window.innerWidth, window.innerHeight);
   });
 
-  const ground = new THREE.Mesh(
-    new THREE.PlaneGeometry(50, 50),
-    new THREE.MeshStandardMaterial({ color: 0x445544 }),
+  const level = createLevel(scene);
+
+  return { scene, camera, renderer, level };
+}
+
+function setupPlayer({
+  camera,
+  renderer,
+  level,
+}: Pick<ReturnType<typeof setupScene>, "camera" | "renderer" | "level">) {
+  const controller = new PlayerController(
+    camera,
+    renderer.domElement,
+    level.colliderMeshes,
+    level.spawnPosition,
   );
-  ground.rotation.x = -Math.PI / 2;
-  scene.add(ground);
 
-  const cube = new THREE.Mesh(
-    new THREE.BoxGeometry(1, 1, 1),
-    new THREE.MeshStandardMaterial({ color: 0x2266ff }),
-  );
-  cube.position.set(0, 0.5, 0);
-  scene.add(cube);
+  // Standard PointerLockControls pattern: pointer lock can only be requested
+  // from a user gesture, so the overlay's click is that gesture. The
+  // overlay itself is shown/hidden off the controls' own lock/unlock events
+  // (which PointerLockControls fires in response to the browser's
+  // pointerlockchange/pointerlockerror events).
+  const overlay = document.getElementById("overlay");
+  overlay?.addEventListener("click", () => controller.controls.lock());
+  controller.controls.addEventListener("lock", () => overlay?.classList.add("hidden"));
+  controller.controls.addEventListener("unlock", () => overlay?.classList.remove("hidden"));
 
-  const hemiLight = new THREE.HemisphereLight(0xffffff, 0x444444, 1.5);
-  scene.add(hemiLight);
-
-  const dirLight = new THREE.DirectionalLight(0xffffff, 1);
-  dirLight.position.set(5, 10, 5);
-  scene.add(dirLight);
-
-  return { scene, camera, renderer, cube };
+  return controller;
 }
 
 function startRenderLoop({
   scene,
   camera,
   renderer,
-  cube,
-}: ReturnType<typeof setupScene>) {
+  controller,
+}: ReturnType<typeof setupScene> & { controller: PlayerController }) {
+  const clock = new THREE.Clock();
+
   function tick() {
-    cube.rotation.y += 0.01;
+    const delta = Math.min(clock.getDelta(), 0.1); // clamp to avoid spikes after tab-switch
+    controller.update(delta);
     renderer.render(scene, camera);
     requestAnimationFrame(tick);
   }
@@ -74,5 +83,7 @@ function connectToServer() {
     .catch((err) => console.error("colyseus join failed", err));
 }
 
-startRenderLoop(setupScene());
+const sceneSetup = setupScene();
+const controller = setupPlayer(sceneSetup);
+startRenderLoop({ ...sceneSetup, controller });
 connectToServer();
