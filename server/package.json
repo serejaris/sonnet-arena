@@ -1,0 +1,23 @@
+{
+  "name": "server",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js"
+  },
+  "dependencies": {
+    "colyseus": "^0.17.10",
+    "@colyseus/schema": "^4.0.27",
+    "@colyseus/ws-transport": "^0.17.13",
+    "express": "^5.2.1"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "tsx": "^4.22.4",
+    "@types/express": "^5.0.6",
+    "@types/node": "^26.0.1"
+  }
+}
