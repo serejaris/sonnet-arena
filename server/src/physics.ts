@@ -18,8 +18,10 @@ const GRAVITY = -30;
 const JUMP_SPEED = 9;
 const MOVE_SPEED = 6;
 
-const CAPSULE_RADIUS = 0.4;
-const CAPSULE_HEIGHT = 1.8;
+// Exported: M3's combat.ts needs the exact same capsule dimensions to build
+// the per-player hit-test segment that movement collision already uses here.
+export const CAPSULE_RADIUS = 0.4;
+export const CAPSULE_HEIGHT = 1.8;
 
 // Below this, the player is assumed to have fallen out of the level — mirrors
 // client/src/playerController.ts's RESPAWN_Y_THRESHOLD fall-recovery behavior.

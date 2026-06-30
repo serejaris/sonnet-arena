@@ -2,12 +2,15 @@ import * as THREE from "three";
 import { Client, getStateCallbacks } from "@colyseus/sdk";
 import { CAPSULE_HEIGHT, CAPSULE_RADIUS, type NetworkInput } from "./playerController";
 import type { PlayerController } from "./playerController";
+import type { Hud } from "./hud";
 
 /**
- * M2 networking: connects to the Colyseus "arena" room, sends this client's
- * predicted input every tick, reconciles the local player's predicted
- * position against the server's authoritative state, and renders/interpolates
- * every other connected player.
+ * M2/M3 networking: connects to the Colyseus "arena" room, sends this
+ * client's predicted input every tick, reconciles the local player's
+ * predicted position against the server's authoritative state, renders/
+ * interpolates every other connected player, sends combat messages
+ * (`shoot`/`respawn`) and reacts to the server's combat broadcasts
+ * (`hit`/`death`) plus the local player's own hp/alive schema fields.
  *
  * The room is joined without a compile-time root schema (the client package
  * intentionally has no dependency on server/src/schema/ArenaState.ts — see
@@ -17,14 +20,31 @@ import type { PlayerController } from "./playerController";
  * reads from them.
  */
 
-// Player.x/y/z/rotY/lastProcessedInputSeq as decoded by the SDK at runtime
-// (see server/src/schema/ArenaState.ts for the authoritative definition).
+// Player.x/y/z/rotY/hp/alive/lastProcessedInputSeq as decoded by the SDK at
+// runtime (see server/src/schema/ArenaState.ts for the authoritative
+// definition).
 interface RemotePlayerState {
   x: number;
   y: number;
   z: number;
   rotY: number;
+  hp: number;
+  alive: boolean;
   lastProcessedInputSeq: number;
+}
+
+// Server broadcasts, per PLAN.md's network protocol contract / the M3 server
+// report in server/src/rooms/ArenaRoom.ts.
+interface HitMessage {
+  targetId: string;
+  shooterId: string;
+  damage: number;
+  newHp: number;
+}
+
+interface DeathMessage {
+  targetId: string;
+  killerId: string;
 }
 
 // One input this client sent, kept around until the server confirms it was
@@ -158,9 +178,15 @@ export class NetworkClient {
   private pendingInputs: BufferedInput[] = [];
   private readonly remotePlayers = new Map<string, RemotePlayer>();
 
+  // Mirrors the schema default (Player.alive = true) so shooting is enabled
+  // from the moment the local player connects, before the first state patch
+  // arrives.
+  private localAlive = true;
+
   constructor(
     private readonly scene: THREE.Scene,
     private readonly controller: PlayerController,
+    private readonly hud: Hud,
   ) {}
 
   async connect(): Promise<void> {
@@ -174,14 +200,25 @@ export class NetworkClient {
     this.localSessionId = room.sessionId;
     console.log("joined", room.sessionId);
 
+    room.onMessage("welcome", (message: { sessionId: string; spawnPoint: { x: number; y: number; z: number } }) => {
+      console.log("welcome", message);
+    });
+
     const $ = getStateCallbacks(room);
 
     $(room.state as any).players.onAdd((player: RemotePlayerState, sessionId: string) => {
       if (sessionId === this.localSessionId) {
         // Reconciliation: re-run whenever ANY of this player's fields change
-        // (x/y/z/rotY/lastProcessedInputSeq all live on the same instance,
-        // and arrive together in one state patch).
-        $(player as any).onChange(() => this.reconcileLocalPlayer(player));
+        // (x/y/z/rotY/hp/alive/lastProcessedInputSeq all live on the same
+        // instance, and arrive together in one state patch). hp/alive are
+        // driven from this same schema-onChange path rather than from the
+        // "hit"/"death" broadcasts below — it's the same pattern already
+        // established for position, and stays correct even if a broadcast
+        // is ever missed.
+        $(player as any).onChange(() => {
+          this.reconcileLocalPlayer(player);
+          this.updateLocalCombatState(player);
+        });
         return;
       }
 
@@ -217,6 +254,21 @@ export class NetworkClient {
       disposeMesh(remote.mesh);
       this.remotePlayers.delete(sessionId);
     });
+
+    // Hit-marker confirmation for shots THIS client fired. Damage itself is
+    // never applied from this broadcast — see updateLocalCombatState/the
+    // local player's own hp/alive onChange above for that.
+    room.onMessage("hit", (message: HitMessage) => {
+      if (message.shooterId === this.localSessionId) {
+        this.hud.showHitMarker();
+      }
+    });
+
+    room.onMessage("death", (message: DeathMessage) => {
+      const killerName = this.lookupPlayerName(message.killerId);
+      const victimName = this.lookupPlayerName(message.targetId);
+      this.hud.addKillFeedEntry(killerName, victimName);
+    });
   }
 
   /** Called once per local physics tick with the input that just drove prediction. */
@@ -243,5 +295,45 @@ export class NetworkClient {
       { x: player.x, y: player.y, z: player.z },
       this.pendingInputs,
     );
+  }
+
+  private updateLocalCombatState(player: RemotePlayerState): void {
+    this.hud.setHp(player.hp);
+    this.localAlive = player.alive;
+    if (player.alive) {
+      this.hud.hideDeathOverlay();
+    } else {
+      this.hud.showDeathOverlay();
+    }
+  }
+
+  private lookupPlayerName(sessionId: string): string {
+    const player = (this.room?.state as any)?.players?.get(sessionId);
+    if (player && typeof player.name === "string" && player.name.length > 0) {
+      return player.name;
+    }
+    return sessionId.slice(0, 6);
+  }
+
+  /** Whether the local player is currently alive — gates shoot input (see weapon.ts). */
+  isAlive(): boolean {
+    return this.localAlive;
+  }
+
+  /** Meshes of every OTHER connected player, for the client's local instant-feedback raycast (see weapon.ts). */
+  getRemoteMeshes(): THREE.Object3D[] {
+    return [...this.remotePlayers.values()].map((remote) => remote.mesh);
+  }
+
+  /** Sends this client's "shoot" message — server re-raycasts authoritatively, see PLAN.md. */
+  shoot(origin: { x: number; y: number; z: number }, dir: { x: number; y: number; z: number }): void {
+    if (!this.room) return;
+    this.room.send("shoot", { origin, dir, ts: Date.now() });
+  }
+
+  /** Sends the one-shot "respawn" message after death. */
+  respawn(): void {
+    if (!this.room) return;
+    this.room.send("respawn", {});
   }
 }

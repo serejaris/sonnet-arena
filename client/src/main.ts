@@ -2,6 +2,8 @@ import * as THREE from "three";
 import { createLevel } from "./level";
 import { PlayerController } from "./playerController";
 import { NetworkClient } from "./network";
+import { Hud } from "./hud";
+import { WeaponController } from "./weapon";
 
 function setupScene() {
   const scene = new THREE.Scene();
@@ -29,11 +31,14 @@ function setupScene() {
   return { scene, camera, renderer, level };
 }
 
-function setupPlayer({
-  camera,
-  renderer,
-  level,
-}: Pick<ReturnType<typeof setupScene>, "camera" | "renderer" | "level">) {
+function setupPlayer(
+  {
+    camera,
+    renderer,
+    level,
+  }: Pick<ReturnType<typeof setupScene>, "camera" | "renderer" | "level">,
+  hud: Hud,
+) {
   const controller = new PlayerController(
     camera,
     renderer.domElement,
@@ -45,11 +50,18 @@ function setupPlayer({
   // from a user gesture, so the overlay's click is that gesture. The
   // overlay itself is shown/hidden off the controls' own lock/unlock events
   // (which PointerLockControls fires in response to the browser's
-  // pointerlockchange/pointerlockerror events).
+  // pointerlockchange/pointerlockerror events). The crosshair follows the
+  // same lock/unlock events — only meaningful while actually playing.
   const overlay = document.getElementById("overlay");
   overlay?.addEventListener("click", () => controller.controls.lock());
-  controller.controls.addEventListener("lock", () => overlay?.classList.add("hidden"));
-  controller.controls.addEventListener("unlock", () => overlay?.classList.remove("hidden"));
+  controller.controls.addEventListener("lock", () => {
+    overlay?.classList.add("hidden");
+    hud.setCrosshairVisible(true);
+  });
+  controller.controls.addEventListener("unlock", () => {
+    overlay?.classList.remove("hidden");
+    hud.setCrosshairVisible(false);
+  });
 
   return controller;
 }
@@ -82,7 +94,15 @@ function startRenderLoop({
 }
 
 const sceneSetup = setupScene();
-const controller = setupPlayer(sceneSetup);
-const network = new NetworkClient(sceneSetup.scene, controller);
+const hud = new Hud();
+const controller = setupPlayer(sceneSetup, hud);
+const network = new NetworkClient(sceneSetup.scene, controller, hud);
+new WeaponController(
+  sceneSetup.scene,
+  sceneSetup.camera,
+  controller,
+  network,
+  sceneSetup.level.colliderMeshes,
+);
 network.connect().catch((err) => console.error("colyseus connect failed", err));
 startRenderLoop({ ...sceneSetup, controller, network });

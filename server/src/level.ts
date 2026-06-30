@@ -31,6 +31,20 @@ const OBSTACLE_LAYOUT: Array<[number, number, number, number, number]> = [
 
 export const SPAWN_POSITION = new THREE.Vector3(0, 0, 0);
 
+// M3 respawn points: the 4 interior "corners" of the arena, picked to sit
+// clear of every OBSTACLE_LAYOUT box (closest clearance ~5 units, capsule
+// radius is 0.4) and clear of the outer walls (half=20, these are at 13 —
+// 6.5 units of interior clearance past wall thickness/capsule radius), so a
+// respawning player can never pop inside or pressed against geometry.
+// Plain {x,y,z} objects (not THREE.Vector3) since ArenaRoom only ever reads
+// these into Player schema fields, never needs vector math on them.
+export const RESPAWN_POINTS: Array<{ x: number; y: number; z: number }> = [
+  { x: 13, y: 0, z: 13 },
+  { x: -13, y: 0, z: 13 },
+  { x: -13, y: 0, z: -13 },
+  { x: 13, y: 0, z: -13 },
+];
+
 function buildColliderMeshes(): THREE.Mesh[] {
   const meshes: THREE.Mesh[] = [];
   const half = ARENA_SIZE / 2;
