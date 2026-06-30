@@ -30,8 +30,16 @@
   - Ручной `http.createServer(app) → httpServer.listen()` молча ломает matchmaking: `WebSocketTransport` вешает свой internal Express app вторым `"request"`-листенером на тот же `http.Server`, и если передать готовый `app` напрямую в `http.createServer`, он 404-ит все `/matchmake/...` маршруты раньше, чем до них доходит Colyseus. Рабочий паттерн: `new Server({ express: (app) => {...} })` (получаем тот же internal app, на который Colyseus сам вешает свои маршруты) + `gameServer.listen(port)` (не `httpServer.listen()` — именно `listen()`/`serverless()` биндит роуты).
 - **Клиентский SDK — `@colyseus/sdk`, не `colyseus.js`.** `colyseus.js` заморожен на `0.16.22` и протокол-несовместим с сервером 0.17.x (тихо ломает join). `@colyseus/sdk` — актуальный пакет под тот же протокол, API (`Client`, `joinOrCreate`) идентичен.
 - **Версии зависимостей запинены, не `"*"`** — во всех `package.json` (root/client/server) версии зафиксированы на то, что реально резолвнулось при первом `npm install` (см. `package-lock.json`). Решение принято после того, как `"*"` чуть не протащил несовместимый клиентский пакет в M0 незаметно для тайпчекера и сборки — `tsc`/`vite build` не ловят protocol-mismatch, только реальный e2e join.
+- **`three-mesh-bvh@0.9.x` — современный API, не `computeBoundsTree()`-на-прототипе из старых туториалов.** `playerController.ts` использует `new MeshBVH(mergedGeometry)` + `shapecast({ intersectsBounds, intersectsTriangle })` напрямую, без monkey-patch `THREE.BufferGeometry.prototype`.
+
+## Headless-верификация клиента
+
+Playwright + закэшированный Chromium доступны на машине (`npx playwright`). Для M1+ клиентских фич верифицировать через headless-браузер (console errors, скриншот рендера, симуляция инпута), не только `tsc`/`vite build` — сборка не ловит runtime-баги (PointerLockControls, BVH-коллизии и т.п.).
+
+**Pointer Lock API не работает под CDP-автоматизацией Chromium** (известное ограничение headless/automation, не баг приложения) — `document.pointerLockElement` остаётся `null` после синтетического клика. Чтобы проверить логику движения, которая гейтится на `controls.isLocked`, нужно симулировать состояние lock вручную: override read-only `document.pointerLockElement` getter + dispatch реального `pointerlockchange` event — это тот же сигнал, на который подписан `PointerLockControls`.
 
 ## Updates
 
 - **2026-06-30:** репозиторий сделан публичным (по запросу), файл правил создан, M0–M7 разбиты на sub-issues issue #1.
 - **2026-06-30:** M0 реализован и проверен end-to-end (реальный join клиент↔сервер, не только сборка) — client/server скелеты, `closes #2`. Отклонения от `PLAN.md` зафиксированы выше.
+- **2026-06-30:** M1 реализован и проверен headless Playwright (рендер уровня, WASD/mouse-look/jump, коллизии со стенами без туннелирования) — `closes #3`. Pointer-lock-в-headless ограничение и приём верификации зафиксированы выше.
