@@ -28,6 +28,13 @@ function setupScene() {
 
   const level = createLevel(scene);
 
+  // M4: the camera needs to be part of the scene graph for its own children
+  // (the weapon view-model, see weapon.ts) to be traversed/rendered by
+  // renderer.render(scene, camera) — otherwise anything parented under
+  // `camera` sits outside `scene` and never draws. The camera object itself
+  // has no visible geometry, so this is a no-op for everything else.
+  scene.add(camera);
+
   return { scene, camera, renderer, level };
 }
 
@@ -86,7 +93,7 @@ function startRenderLoop({
       network.sendInput(frameInput, delta);
     }
 
-    network.updateRemoteInterpolation();
+    network.updateRemoteInterpolation(delta);
     renderer.render(scene, camera);
     requestAnimationFrame(tick);
   }

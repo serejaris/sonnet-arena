@@ -1,8 +1,9 @@
 import * as THREE from "three";
 import { Client, getStateCallbacks } from "@colyseus/sdk";
-import { CAPSULE_HEIGHT, CAPSULE_RADIUS, type NetworkInput } from "./playerController";
+import type { NetworkInput } from "./playerController";
 import type { PlayerController } from "./playerController";
 import type { Hud } from "./hud";
+import { createRemoteCharacter, type AnimName, type RemoteCharacter } from "./character";
 
 /**
  * M2/M3 networking: connects to the Colyseus "arena" room, sends this
@@ -63,9 +64,24 @@ interface RemoteSnapshot {
   t: number;
 }
 
+// Per-remote-player character model/animation state (M4 asset swap). The
+// glTF clone loads asynchronously (see character.ts), so `loaded` starts
+// null and this whole struct is populated in place once it resolves —
+// `mesh`/`snapshots` above don't wait on it, interpolation works from the
+// very first snapshot regardless of asset load latency.
+interface RemoteCharacterState {
+  loaded: RemoteCharacter | null;
+  /** The continuous locomotion/death state currently playing (excludes the transient "shoot" overlay — see shootUntil). */
+  currentAnim: AnimName;
+  alive: boolean;
+  /** performance.now() timestamp until which a triggered "shoot" one-shot should keep playing uninterrupted by the idle/run/jump/death state machine. */
+  shootUntil: number;
+}
+
 interface RemotePlayer {
   mesh: THREE.Object3D;
   snapshots: RemoteSnapshot[];
+  character: RemoteCharacterState;
 }
 
 // Fixed render-behind delay for remote-player interpolation (Gambetta-style
@@ -79,42 +95,21 @@ const INTERP_DELAY_MS = 100;
 // backgrounded and misses render frames for a while.
 const MAX_SNAPSHOTS = 10;
 
-function createRemotePlayerMesh(): THREE.Object3D {
-  const group = new THREE.Group();
+// Animation state thresholds (M4). Real server-authoritative x/z/y are
+// exact (no sensor noise), so these only need to clear float jitter, not
+// filter real signal — well below playerController.ts's MOVE_SPEED (6 m/s)
+// and JUMP_SPEED (9 m/s, decelerating under gravity) so genuine
+// movement/jumps clear them comfortably.
+const RUN_SPEED_THRESHOLD = 0.5; // m/s horizontal
+const JUMP_RISE_SPEED_THRESHOLD = 1.0; // m/s vertical, rising only
+const ANIM_CROSSFADE_S = 0.15;
 
-  const cylinderLength = Math.max(CAPSULE_HEIGHT - CAPSULE_RADIUS * 2, 0.01);
-  const body = new THREE.Mesh(
-    new THREE.CapsuleGeometry(CAPSULE_RADIUS, cylinderLength, 4, 8),
-    new THREE.MeshStandardMaterial({ color: 0xdd4444 }),
-  );
-  body.position.y = CAPSULE_HEIGHT / 2;
-  group.add(body);
-
-  // Facing indicator — a capsule alone is rotationally symmetric around Y,
-  // so without this `rotY` interpolation would be invisible. Sits on the
-  // -Z side, matching the rotY=0 -> forward=(0,0,-1) convention shared with
-  // playerController.ts / server/src/physics.ts.
-  const nose = new THREE.Mesh(
-    new THREE.BoxGeometry(0.18, 0.18, 0.3),
-    new THREE.MeshStandardMaterial({ color: 0xffe28a }),
-  );
-  nose.position.set(0, CAPSULE_HEIGHT - 0.3, -CAPSULE_RADIUS - 0.12);
-  group.add(nose);
-
-  return group;
-}
-
-function disposeMesh(object: THREE.Object3D): void {
-  object.traverse((child) => {
-    if (child instanceof THREE.Mesh) {
-      child.geometry.dispose();
-      if (Array.isArray(child.material)) {
-        child.material.forEach((m) => m.dispose());
-      } else {
-        child.material.dispose();
-      }
-    }
-  });
+function createRemotePlayerWrapper(): THREE.Object3D {
+  // Empty until the shared character template (character.ts) finishes
+  // loading and this player's clone is attached — interpolation still
+  // works immediately since applySnapshot/interpolateRemote only ever
+  // touch this wrapper's position/rotation, never its children.
+  return new THREE.Group();
 }
 
 /** Shortest-path lerp between two angles (radians), avoiding the ±π wraparound jump. */
@@ -222,13 +217,31 @@ export class NetworkClient {
         return;
       }
 
-      const mesh = createRemotePlayerMesh();
+      const mesh = createRemotePlayerWrapper();
       this.scene.add(mesh);
       const snapshots: RemoteSnapshot[] = [
         { x: player.x, y: player.y, z: player.z, rotY: player.rotY, t: performance.now() },
       ];
       applySnapshot(mesh, snapshots[0]);
-      this.remotePlayers.set(sessionId, { mesh, snapshots });
+      const remote: RemotePlayer = {
+        mesh,
+        snapshots,
+        character: { loaded: null, currentAnim: "idle", alive: player.alive, shootUntil: 0 },
+      };
+      this.remotePlayers.set(sessionId, remote);
+
+      // Fire-and-forget: resolves against the shared cached template (see
+      // character.ts), so only the very first remote player pays real load
+      // latency. Guarded by the map lookup in case this player already
+      // disconnected by the time it resolves.
+      createRemoteCharacter()
+        .then((rc) => {
+          if (!this.remotePlayers.has(sessionId)) return;
+          remote.character.loaded = rc;
+          mesh.add(rc.root);
+          rc.actions.idle?.play();
+        })
+        .catch((err) => console.error("failed to load remote character model", err));
 
       $(player as any).onChange(() => {
         const remote = this.remotePlayers.get(sessionId);
@@ -243,6 +256,7 @@ export class NetworkClient {
         if (remote.snapshots.length > MAX_SNAPSHOTS) {
           remote.snapshots.splice(0, remote.snapshots.length - MAX_SNAPSHOTS);
         }
+        remote.character.alive = player.alive;
       });
     });
 
@@ -251,17 +265,29 @@ export class NetworkClient {
       const remote = this.remotePlayers.get(sessionId);
       if (!remote) return;
       this.scene.remove(remote.mesh);
-      disposeMesh(remote.mesh);
+      // Deliberately no geometry/material .dispose() here: SkeletonUtils.clone
+      // (character.ts) reuses the shared template's geometries/materials by
+      // reference across every remote player's clone (see its own doc
+      // comment) — disposing them on one player leaving would pull the GPU
+      // buffers out from under every other still-connected player using the
+      // same character model.
       this.remotePlayers.delete(sessionId);
     });
 
-    // Hit-marker confirmation for shots THIS client fired. Damage itself is
-    // never applied from this broadcast — see updateLocalCombatState/the
-    // local player's own hp/alive onChange above for that.
+    // Hit-marker confirmation for shots THIS client fired, and a best-effort
+    // "shoot" animation trigger for bystanders watching whoever fired (both
+    // driven off the same broadcast — misses aren't broadcast at all, so a
+    // remote player's shoot animation simply won't play for shots that miss
+    // everyone, which is an accepted gap, not a bug). Damage itself is never
+    // applied from this broadcast — see updateLocalCombatState/the local
+    // player's own hp/alive onChange above for that.
     room.onMessage("hit", (message: HitMessage) => {
       if (message.shooterId === this.localSessionId) {
         this.hud.showHitMarker();
+        return;
       }
+      const shooter = this.remotePlayers.get(message.shooterId);
+      if (shooter) this.triggerRemoteShoot(shooter);
     });
 
     room.onMessage("death", (message: DeathMessage) => {
@@ -281,12 +307,82 @@ export class NetworkClient {
     this.pendingInputs.push(message);
   }
 
-  /** Called once per render frame to advance remote-player interpolation. */
-  updateRemoteInterpolation(): void {
+  /** Called once per render frame to advance remote-player interpolation and character animation. */
+  updateRemoteInterpolation(delta: number): void {
     const renderTime = performance.now() - INTERP_DELAY_MS;
+    const now = performance.now();
     for (const remote of this.remotePlayers.values()) {
       interpolateRemote(remote, renderTime);
+      this.updateRemoteAnimationState(remote, now);
+      remote.character.loaded?.mixer.update(delta);
     }
+  }
+
+  /** Decides idle/run/jump/death every frame from data already tracked on `remote` — see the RemoteCharacterState doc comment. */
+  private updateRemoteAnimationState(remote: RemotePlayer, now: number): void {
+    if (!remote.character.loaded) return; // model still loading — nothing to animate yet
+
+    if (!remote.character.alive) {
+      if (remote.character.currentAnim !== "death") {
+        this.setRemoteAnim(remote, "death", true);
+      }
+      return;
+    }
+
+    // A "shoot" one-shot is currently overlaying idle/run/jump — let it
+    // finish before the continuous state machine below resumes driving.
+    if (now < remote.character.shootUntil) return;
+
+    const desired = this.computeContinuousAnim(remote);
+    if (desired !== remote.character.currentAnim) {
+      this.setRemoteAnim(remote, desired, false);
+    }
+  }
+
+  /** idle vs run vs jump, purely from the two most recent position snapshots — see RUN_SPEED_THRESHOLD/JUMP_RISE_SPEED_THRESHOLD. */
+  private computeContinuousAnim(remote: RemotePlayer): AnimName {
+    const snapshots = remote.snapshots;
+    if (snapshots.length < 2) return "idle";
+
+    const from = snapshots[snapshots.length - 2];
+    const to = snapshots[snapshots.length - 1];
+    const dt = (to.t - from.t) / 1000;
+    if (dt <= 0) return remote.character.currentAnim;
+
+    const risingSpeed = (to.y - from.y) / dt;
+    if (risingSpeed > JUMP_RISE_SPEED_THRESHOLD) return "jump";
+
+    const horizontalSpeed = Math.hypot(to.x - from.x, to.z - from.z) / dt;
+    return horizontalSpeed > RUN_SPEED_THRESHOLD ? "run" : "idle";
+  }
+
+  /** Crossfades from whatever continuous action is currently playing into `name`, tracked as the new `currentAnim`. */
+  private setRemoteAnim(remote: RemotePlayer, name: AnimName, loopOnce: boolean): void {
+    const rc = remote.character.loaded;
+    if (!rc) return;
+    const next = rc.actions[name];
+    if (!next) return; // best-effort — that vocabulary slot has no clip in this pack (see character.ts's CLIP_NAMES)
+
+    const prev = remote.character.currentAnim !== name ? rc.actions[remote.character.currentAnim] : undefined;
+
+    next.reset();
+    next.setLoop(loopOnce ? THREE.LoopOnce : THREE.LoopRepeat, loopOnce ? 1 : Infinity);
+    next.clampWhenFinished = loopOnce;
+    next.play();
+    if (prev && prev !== next) {
+      next.crossFadeFrom(prev, ANIM_CROSSFADE_S, false);
+    }
+    remote.character.currentAnim = name;
+  }
+
+  /** Best-effort "shoot" one-shot for a remote player another client's shot was attributed to (see the "hit" handler). */
+  private triggerRemoteShoot(remote: RemotePlayer): void {
+    if (!remote.character.alive) return; // don't overlay a shoot pose on a dead ragdoll-less character
+    const action = remote.character.loaded?.actions.shoot;
+    if (!action) return;
+
+    this.setRemoteAnim(remote, "shoot", true);
+    remote.character.shootUntil = performance.now() + action.getClip().duration * 1000;
   }
 
   private reconcileLocalPlayer(player: RemotePlayerState): void {

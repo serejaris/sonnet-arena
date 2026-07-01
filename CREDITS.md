@@ -4,4 +4,6 @@ Every imported 3D asset pack gets one line here: source, license, URL. CC0 is th
 
 | Pack | License | Source | Used for |
 |---|---|---|---|
-| _(none imported yet)_ | | | |
+| KayKit Character Pack — Adventurers 1.0 | CC0 | https://github.com/KayKit-Game-Assets/KayKit-Character-Pack-Adventures-1.0 | Player character model + animation set (`models/characters/adventurer.glb`, Knight variant) |
+| Kenney Blaster Kit (2.1) | CC0 | https://kenney.nl/assets/blaster-kit | Ranged weapon prop (`models/weapons/blaster.glb`, `blaster-d`) |
+| KayKit Dungeon Remastered 1.0 | CC0 | https://github.com/KayKit-Game-Assets/KayKit-Dungeon-Remastered-1.0 | Level geometry — wall, floor tile, crate props (`models/props/wall.glb`, `floor.glb`, `crate.glb`, `crate_large.glb`) |
